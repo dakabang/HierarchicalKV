@@ -1519,6 +1519,53 @@ class HashTable {
   }
 
   /**
+   *  TODO: add comment
+   **/
+  void find(const size_type n, const key_type* keys,  // (n)
+            value_type* values,                       // (n, DIM)
+            key_type* missed_keys,                    // (missed_size)
+            int* missed_indices,                      // (missed_size)
+            int* missed_size,                         // scalar
+            score_type* scores = nullptr,             // (n)
+            cudaStream_t stream = 0) const {
+    MERLIN_CHECK(is_fast_mode(),
+                 "[HierarchicalKV] this `find` must run on pure HBM");
+    if (n == 0) {
+      return;
+    }
+
+    read_shared_lock lock(mutex_);
+    
+    CUDA_CHECK(cudaMemsetAsync(missed_size, 0, sizeof(*missed_size), stream));
+
+    const uint32_t value_size = options_.dim * sizeof(V);
+    using Selector = SelectPipelineLookupKernelWithIO<key_type, value_type,
+                                                      score_type, ArchTag>;
+    const uint32_t pipeline_max_size = Selector::max_value_size();
+    // Pipeline lookup kernel only supports "bucket_size = 128".
+    if (options_.max_bucket_size == 128 && value_size <= pipeline_max_size) {
+      LookupKernelParamsV2<key_type, value_type, score_type> lookupParams(
+          table_->buckets, table_->buckets_num, static_cast<uint32_t>(dim()),
+          keys, values, scores, missed_keys, missed_indices, missed_size, n);
+      Selector::select_kernel(lookupParams, stream);
+    } else {
+      using Selector =
+          SelectLookupKernelWithIOV2<key_type, value_type, score_type>;
+      static thread_local int step_counter = 0;
+      static thread_local float load_factor = 0.0;
+
+      if (((step_counter++) % kernel_select_interval_) == 0) {
+        load_factor = fast_load_factor(0, stream, false);
+      }
+      Selector::execute_kernel(load_factor, options_.block_size,
+                               options_.max_bucket_size, table_->buckets_num,
+                               options_.dim, stream, n, d_table_,
+                               table_->buckets, keys, values, scores,
+                               missed_keys, missed_indices, missed_size);
+    }
+  }
+
+  /**
    * @brief Searches the hash table for the specified keys and returns address
    * of the values.
    *
