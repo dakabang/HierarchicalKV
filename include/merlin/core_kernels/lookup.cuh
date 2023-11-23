@@ -23,7 +23,8 @@ namespace merlin {
 
 template <typename K>
 struct FoundFunctorV1 {
-  FoundFunctorV1(bool* __restrict founds_) : founds(founds_) {}
+  __host__ __device__ FoundFunctorV1(bool* __restrict founds_)
+      : founds(founds_) {}
 
   __forceinline__ __device__ void update(const int idx, const K /*key*/,
                                          const bool found) {
@@ -37,8 +38,9 @@ struct FoundFunctorV1 {
 
 template <typename K>
 struct FoundFunctorV2 {
-  FoundFunctorV2(K* __restrict missed_keys_, int* __restrict missed_indices_,
-                 int* __restrict missed_size_)
+  __host__ __device__ FoundFunctorV2(K* __restrict missed_keys_,
+                                     int* __restrict missed_indices_,
+                                     int* __restrict missed_size_)
       : missed_keys(missed_keys_),
         missed_indices(missed_indices_),
         missed_size(missed_size_) {}
@@ -992,12 +994,13 @@ struct SelectLookupKernelWithIOV2 {
 };
 
 // Use 1 thread to deal with a KV-pair, exculing copying value.
-template <typename K, typename V, typename S>
-__global__ void tlp_lookup_kernel_hybrid(
+template <typename K, typename V, typename S,
+          typename FoundFunctor = FoundFunctorV1<K>>
+__device__ void tlp_lookup_kernel_hybrid_impl(
     Bucket<K, V, S>* __restrict__ buckets, const uint64_t buckets_num,
     uint32_t bucket_capacity, const uint32_t dim, const K* __restrict__ keys,
     V** __restrict values, S* __restrict scores, int* __restrict dst_offset,
-    bool* __restrict founds, uint64_t n) {
+    FoundFunctor found_functor, uint64_t n) {
   using BUCKET = Bucket<K, V, S>;
 
   uint32_t tx = threadIdx.x;
@@ -1060,16 +1063,17 @@ __global__ void tlp_lookup_kernel_hybrid(
         possible_pos = pos_cur + i * 4 + index;
         auto current_key = bucket_keys_ptr[possible_pos];
         score = *BUCKET::scores(bucket_keys_ptr, bucket_capacity, possible_pos);
-        if (current_key == key) {
+        bool found = (current_key == key);
+        if (found) {
           key_pos = possible_pos;
           if (scores) {
             scores[kv_idx] = score;
           }
           values[kv_idx] = bucket_values_ptr + key_pos * dim;
-          if (founds) {
-            founds[kv_idx] = true;
-          }
+          found_functor.update(kv_idx, key, found);
           return;
+        } else {
+          values[kv_idx] = nullptr;
         }
       } while (true);
       VecD_Comp empty_digests_ = empty_digests<K>();
@@ -1090,16 +1094,39 @@ __global__ void tlp_lookup_kernel_hybrid(
   }
 }
 
+template <typename K, typename V, typename S>
+__global__ void tlp_lookup_kernel_hybrid(
+    Bucket<K, V, S>* __restrict__ buckets, const uint64_t buckets_num,
+    uint32_t bucket_capacity, const uint32_t dim, const K* __restrict__ keys,
+    V** __restrict values, S* __restrict scores, int* __restrict dst_offset,
+    bool* __restrict founds, uint64_t n) {
+  FoundFunctorV1<K> found_functor(founds);
+  tlp_lookup_kernel_hybrid_impl<K, V, S, decltype(found_functor)>(
+      buckets, buckets_num, bucket_capacity, dim, keys, values, scores,
+      dst_offset, found_functor, n);
+}
+
+template <typename K, typename V, typename S>
+__global__ void tlp_lookup_kernel_hybrid(
+    Bucket<K, V, S>* __restrict__ buckets, const uint64_t buckets_num,
+    uint32_t bucket_capacity, const uint32_t dim, const K* __restrict__ keys,
+    V** __restrict values, S* __restrict scores, int* __restrict dst_offset,
+    K* __restrict missed_keys, int* __restrict missed_indices,
+    int* __restrict missed_size, uint64_t n) {
+  FoundFunctorV2<K> found_functor(missed_keys, missed_indices, missed_size);
+  tlp_lookup_kernel_hybrid_impl<K, V, S, decltype(found_functor)>(
+      buckets, buckets_num, bucket_capacity, dim, keys, values, scores,
+      dst_offset, found_functor, n);
+}
+
 /* lookup kernel.
  */
-template <class K, class V, class S, uint32_t TILE_SIZE = 4>
-__global__ void lookup_kernel(const Table<K, V, S>* __restrict table,
-                              Bucket<K, V, S>* buckets,
-                              const size_t bucket_max_size,
-                              const size_t buckets_num, const size_t dim,
-                              const K* __restrict keys, V** __restrict values,
-                              S* __restrict scores, bool* __restrict found,
-                              int* __restrict dst_offset, size_t N) {
+template <class K, class V, class S, class FoundFunctor, uint32_t TILE_SIZE = 4>
+__device__ void lookup_kernel_impl(
+    const Table<K, V, S>* __restrict table, Bucket<K, V, S>* buckets,
+    const size_t bucket_max_size, const size_t buckets_num, const size_t dim,
+    const K* __restrict keys, V** __restrict values, S* __restrict scores,
+    FoundFunctor found_functor, int* __restrict dst_offset, size_t N) {
   int* buckets_size = table->buckets_size;
 
   auto g = cg::tiled_partition<TILE_SIZE>(cg::this_thread_block());
@@ -1133,15 +1160,13 @@ __global__ void lookup_kernel(const Table<K, V, S>* __restrict table,
     occupy_result = find_without_lock<K, V, S, TILE_SIZE>(
         g, bucket, find_key, start_idx, key_pos, src_lane, bucket_max_size);
 
-    if (occupy_result == OccupyResult::DUPLICATE) {
+    bool found = (occupy_result == OccupyResult::DUPLICATE);
+    if (found) {
       if (rank == src_lane) {
         *(values + key_idx) = (bucket->vectors + key_pos * dim);
         if (scores != nullptr) {
           *(scores + key_idx) =
               bucket->scores(key_pos)->load(cuda::std::memory_order_relaxed);
-        }
-        if (found != nullptr) {
-          *(found + key_idx) = true;
         }
       }
     } else {
@@ -1149,7 +1174,38 @@ __global__ void lookup_kernel(const Table<K, V, S>* __restrict table,
         *(values + key_idx) = nullptr;
       }
     }
+
+    if (rank == 0) {
+      found_functor.update(key_idx, find_key, found);
+    }
   }
+}
+
+template <class K, class V, class S, uint32_t TILE_SIZE = 4>
+__global__ void lookup_kernel(const Table<K, V, S>* __restrict table,
+                              Bucket<K, V, S>* buckets,
+                              const size_t bucket_max_size,
+                              const size_t buckets_num, const size_t dim,
+                              const K* __restrict keys, V** __restrict values,
+                              S* __restrict scores, bool* __restrict founds,
+                              int* __restrict dst_offset, size_t N) {
+  FoundFunctorV1<K> found_functor(founds);
+  lookup_kernel_impl<K, V, S, decltype(found_functor), TILE_SIZE>(
+      table, buckets, bucket_max_size, buckets_num, dim, keys, values, scores,
+      found_functor, dst_offset, N);
+}
+
+template <class K, class V, class S, uint32_t TILE_SIZE = 4>
+__global__ void lookup_kernel(
+    const Table<K, V, S>* __restrict table, Bucket<K, V, S>* buckets,
+    const size_t bucket_max_size, const size_t buckets_num, const size_t dim,
+    const K* __restrict keys, V** __restrict values, S* __restrict scores,
+    K* __restrict missed_keys, int* __restrict missed_indices,
+    int* __restrict missed_size, int* __restrict dst_offset, size_t N) {
+  FoundFunctorV2<K> found_functor(missed_keys, missed_indices, missed_size);
+  lookup_kernel_impl<K, V, S, decltype(found_functor), TILE_SIZE>(
+      table, buckets, bucket_max_size, buckets_num, dim, keys, values, scores,
+      found_functor, dst_offset, N);
 }
 
 }  // namespace merlin

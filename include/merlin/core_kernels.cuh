@@ -583,6 +583,27 @@ __global__ void read_kernel(const V* const* __restrict src, V* __restrict dst,
   }
 }
 
+/*
+ * TODO: add comment
+ */
+template <class K, class V, class S>
+__global__ void read_kernel(const V* const* __restrict src, V* __restrict dst,
+                            const int* __restrict dst_offset, const size_t dim,
+                            size_t N) {
+  size_t tid = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+  for (size_t t = tid; t < N; t += blockDim.x * gridDim.x) {
+    int vec_index = int(t / dim);
+    int dim_index = t % dim;
+    int real_dst_offset =
+        dst_offset != nullptr ? dst_offset[vec_index] : vec_index;
+
+    if (src[vec_index] != nullptr) {
+      dst[real_dst_offset * dim + dim_index] = src[vec_index][dim_index];
+    }
+  }
+}
+
 /* Read the N data from src to each address in *dst,
  *  usually called by upsert kernel.
  *
