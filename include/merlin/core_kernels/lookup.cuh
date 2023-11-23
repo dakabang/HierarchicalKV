@@ -131,8 +131,8 @@ __global__ void lookup_kernel_with_io_pipeline_v1(
   __shared__ K sm_target_keys[BLOCK_SIZE];
   __shared__ K* sm_keys_ptr[BLOCK_SIZE];
   __shared__ VecV* sm_values_ptr[BLOCK_SIZE];
+  __shared__ S sm_target_scores[BLOCK_SIZE];
   // Reuse
-  S* sm_target_scores = reinterpret_cast<S*>(sm_target_keys);
   int* sm_counts = sm_target_digests;
   int* sm_founds = sm_counts;
   // Double buffer
@@ -398,8 +398,8 @@ __global__ void lookup_kernel_with_io_pipeline_v2(
   __shared__ K sm_target_keys[BLOCK_SIZE];
   __shared__ K* sm_keys_ptr[BLOCK_SIZE];
   __shared__ VecV* sm_values_ptr[BLOCK_SIZE];
+  __shared__ S sm_target_scores[BLOCK_SIZE];
   // Reuse
-  S* sm_target_scores = reinterpret_cast<S*>(sm_target_keys);
   int* sm_counts = sm_target_digests;
   int* sm_founds = sm_counts;
   // Double buffer
@@ -1070,7 +1070,7 @@ __device__ void tlp_lookup_kernel_hybrid_impl(
             scores[kv_idx] = score;
           }
           values[kv_idx] = bucket_values_ptr + key_pos * dim;
-          found_functor.update(kv_idx, key, found);
+          found_functor.update(kv_idx, key, true);
           return;
         } else {
           values[kv_idx] = nullptr;
@@ -1087,11 +1087,14 @@ __device__ void tlp_lookup_kernel_hybrid_impl(
         if (offset == 0 && possible_pos < key_pos) continue;
         auto current_key = bucket_keys_ptr[possible_pos];
         if (current_key == static_cast<K>(EMPTY_KEY)) {
+          found_functor.update(kv_idx, key, false);
           return;
         }
       } while (true);
     }
   }
+
+  found_functor.update(kv_idx, key, false);
 }
 
 template <typename K, typename V, typename S>
