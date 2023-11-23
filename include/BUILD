@@ -9,7 +9,7 @@ cuda_library(
         "//visibility:public",
     ],
     deps = [
-        "//include/merlin",
+        "//HierarchicalKV/include/merlin",
         "@local_config_cuda//cuda",
     ],
 )
@@ -23,7 +23,7 @@ cuda_library(
         "//visibility:public",
     ],
     deps = [
-        "//include/merlin",
+        "//HierarchicalKV/include/merlin",
         "@local_config_cuda//cuda",
     ],
 )

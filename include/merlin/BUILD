@@ -11,6 +11,7 @@ cuda_library(
     visibility = [
         "//visibility:public",
     ],
+    include_prefix = "merlin",
     deps = [
         "@local_config_cuda//cuda",
     ],
@@ -34,8 +35,8 @@ cuda_library(
         "//visibility:public",
     ],
     deps = [
-        "//include/merlin:types_and_utils",
-        "//include/merlin/core_kernels",
+        "//HierarchicalKV/include/merlin:types_and_utils",
+        "//HierarchicalKV/include/merlin/core_kernels",
         "@local_config_cuda//cuda",
     ],
 )
